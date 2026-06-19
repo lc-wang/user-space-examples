@@ -30,10 +30,10 @@
 #include <unistd.h>
 #include "png_HEX.h"
 #define EPD_SPI_DEVICE "/dev/spidev0.0"
-#define EPD_GPIO_CHIP "gpiochip0"
+#define EPD_GPIO_CHIP "gpiochip15"
 
-#define EPD_DC_PIN 0
-#define EPD_RST_PIN 5
+#define EPD_DC_PIN 5
+#define EPD_RST_PIN 6
 #define EPD_BUSY_PIN 26
 
 #define SPI_SPEED 5000000
@@ -56,7 +56,105 @@
 
 int spi_fd;
 struct gpiod_chip *chip;
-struct gpiod_line *epd_dc_line, *epd_rst_line, *epd_busy_line;
+struct gpiod_line_request *epd_dc_line, *epd_rst_line, *epd_busy_line;
+
+static const unsigned int EPD_DC_OFFSET   = EPD_DC_PIN;
+static const unsigned int EPD_RST_OFFSET  = EPD_RST_PIN;
+static const unsigned int EPD_BUSY_OFFSET = EPD_BUSY_PIN;
+
+/* libgpiod v2: request one line as output, return its request handle. */
+static struct gpiod_line_request *
+gpiod_request_output(struct gpiod_chip *c, unsigned int offset,
+		     const char *consumer, int value)
+{
+	struct gpiod_line_settings *settings;
+	struct gpiod_line_config *line_cfg;
+	struct gpiod_request_config *req_cfg;
+	struct gpiod_line_request *request = NULL;
+
+	settings = gpiod_line_settings_new();
+	if (!settings)
+		return NULL;
+	gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
+	gpiod_line_settings_set_output_value(settings,
+		value ? GPIOD_LINE_VALUE_ACTIVE : GPIOD_LINE_VALUE_INACTIVE);
+
+	line_cfg = gpiod_line_config_new();
+	if (!line_cfg) {
+		gpiod_line_settings_free(settings);
+		return NULL;
+	}
+	if (gpiod_line_config_add_line_settings(line_cfg, &offset, 1, settings) < 0)
+		goto out;
+
+	req_cfg = gpiod_request_config_new();
+	if (req_cfg)
+		gpiod_request_config_set_consumer(req_cfg, consumer);
+
+	request = gpiod_chip_request_lines(c, req_cfg, line_cfg);
+
+	if (req_cfg)
+		gpiod_request_config_free(req_cfg);
+out:
+	gpiod_line_config_free(line_cfg);
+	gpiod_line_settings_free(settings);
+	return request;
+}
+
+/* libgpiod v2: request one line as input, return its request handle. */
+static struct gpiod_line_request *
+gpiod_request_input(struct gpiod_chip *c, unsigned int offset,
+		    const char *consumer)
+{
+	struct gpiod_line_settings *settings;
+	struct gpiod_line_config *line_cfg;
+	struct gpiod_request_config *req_cfg;
+	struct gpiod_line_request *request = NULL;
+
+	settings = gpiod_line_settings_new();
+	if (!settings)
+		return NULL;
+	gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
+
+	line_cfg = gpiod_line_config_new();
+	if (!line_cfg) {
+		gpiod_line_settings_free(settings);
+		return NULL;
+	}
+	if (gpiod_line_config_add_line_settings(line_cfg, &offset, 1, settings) < 0)
+		goto out;
+
+	req_cfg = gpiod_request_config_new();
+	if (req_cfg)
+		gpiod_request_config_set_consumer(req_cfg, consumer);
+
+	request = gpiod_chip_request_lines(c, req_cfg, line_cfg);
+
+	if (req_cfg)
+		gpiod_request_config_free(req_cfg);
+out:
+	gpiod_line_config_free(line_cfg);
+	gpiod_line_settings_free(settings);
+	return request;
+}
+
+static inline void
+gpiod_set_value(struct gpiod_line_request *req, unsigned int offset, int value)
+{
+	gpiod_line_request_set_value(req, offset,
+		value ? GPIOD_LINE_VALUE_ACTIVE : GPIOD_LINE_VALUE_INACTIVE);
+}
+
+static inline int
+gpiod_get_value(struct gpiod_line_request *req, unsigned int offset)
+{
+	return gpiod_line_request_get_value(req, offset) == GPIOD_LINE_VALUE_ACTIVE
+		? 1 : 0;
+}
+
+#define epd_dc_set(v)    gpiod_set_value(epd_dc_line,   EPD_DC_OFFSET,   (v))
+#define epd_rst_set(v)   gpiod_set_value(epd_rst_line,  EPD_RST_OFFSET,  (v))
+#define epd_busy_get()   gpiod_get_value(epd_busy_line, EPD_BUSY_OFFSET)
 
 static const uint8_t lut_4G[153] = {
 	0x40, 0x48, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -107,20 +205,20 @@ void spi_write(uint8_t *data, int len) {
 }
 
 void epd_writeCommand(uint8_t command) {
-	gpiod_line_set_value(epd_dc_line, 0);
+	epd_dc_set(0);
 	sleep_us(1);
 	spi_write(&command, 1);
 }
 
 void epd_writeData(uint8_t data) {
-	gpiod_line_set_value(epd_dc_line, 1);
+	epd_dc_set(1);
 	sleep_us(1);
 	spi_write(&data, 1);
 }
 
 /* Bulk data write: DC=1 once, then push the buffer in <=4096-byte transfers. */
 void epd_writeData_bulk(const uint8_t *data, int len) {
-	gpiod_line_set_value(epd_dc_line, 1);
+	epd_dc_set(1);
 	sleep_us(1);
 	while (len > 0) {
 		int chunk = len > 4096 ? 4096 : len;
@@ -133,7 +231,7 @@ void epd_writeData_bulk(const uint8_t *data, int len) {
 void epd_waitUntilIdle() {
 	sleep_ms(2);
 	while (true) {
-		if (gpiod_line_get_value(epd_busy_line) == 0) {
+		if (epd_busy_get() == 0) {
 			break;
 		}
 	}
@@ -141,9 +239,9 @@ void epd_waitUntilIdle() {
 
 void epd_HWreset() {
 	sleep_ms(50);
-	gpiod_line_set_value(epd_rst_line, 0);
+	epd_rst_set(0);
 	sleep_ms(50);
-	gpiod_line_set_value(epd_rst_line, 1);
+	epd_rst_set(1);
 	sleep_ms(50);
 }
 
@@ -218,25 +316,21 @@ void epd_init(int mode) {
 	uint32_t speed = SPI_SPEED;
 	ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
 
-	chip = gpiod_chip_open_by_name(EPD_GPIO_CHIP);
+	chip = gpiod_chip_open("/dev/" EPD_GPIO_CHIP);
 	if (!chip) {
 		perror("Error opening GPIO chip");
 		exit(1);
 	}
 
-	epd_dc_line = gpiod_chip_get_line(chip, EPD_DC_PIN);
-	epd_rst_line = gpiod_chip_get_line(chip, EPD_RST_PIN);
-	epd_busy_line = gpiod_chip_get_line(chip, EPD_BUSY_PIN);
+	epd_dc_line   = gpiod_request_output(chip, EPD_DC_OFFSET,   "epd_dc", 0);
+	epd_rst_line  = gpiod_request_output(chip, EPD_RST_OFFSET,  "epd_rst", 0);
+	epd_busy_line = gpiod_request_input(chip,  EPD_BUSY_OFFSET, "epd_busy");
 
 	if (!epd_dc_line || !epd_rst_line || !epd_busy_line) {
-		perror("Error getting GPIO lines");
+		perror("Error requesting GPIO lines");
 		gpiod_chip_close(chip);
 		exit(1);
 	}
-
-	gpiod_line_request_output(epd_dc_line, "epd_dc", 0);
-	gpiod_line_request_output(epd_rst_line, "epd_rst", 0);
-	gpiod_line_request_input(epd_busy_line, "epd_busy");
 
 	printf("start\n");
 	epd_HWreset();
@@ -566,9 +660,9 @@ static void epd_partial_regs(void) {
  * fight the ping-pong and scramble the image.
  */
 void epd_display_partial_full(const uint8_t *image) {
-	gpiod_line_set_value(epd_rst_line, 0);	/* reset pulse (RAM is preserved) */
+	epd_rst_set(0);	/* reset pulse (RAM is preserved) */
 	sleep_ms(2);
-	gpiod_line_set_value(epd_rst_line, 1);
+	epd_rst_set(1);
 	sleep_ms(2);
 
 	epd_partial_regs();
@@ -757,9 +851,9 @@ int main(int argc, char **argv) {
 	}
 
 	close(spi_fd);
-	gpiod_line_release(epd_dc_line);
-	gpiod_line_release(epd_rst_line);
-	gpiod_line_release(epd_busy_line);
+	gpiod_line_request_release(epd_dc_line);
+	gpiod_line_request_release(epd_rst_line);
+	gpiod_line_request_release(epd_busy_line);
 	gpiod_chip_close(chip);
 
 	return 0;
